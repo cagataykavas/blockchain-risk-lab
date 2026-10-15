@@ -7,6 +7,7 @@ from .finality import (
     FinalityAssessment,
     FinalityTracker,
     ReorgEvent,
+    SnapshotValidationError,
 )
 
 __all__ = [
@@ -16,4 +17,6 @@ __all__ = [
     "FinalityAssessment",
     "FinalityTracker",
     "ReorgEvent",
+    "SnapshotValidationError",
 ]
+

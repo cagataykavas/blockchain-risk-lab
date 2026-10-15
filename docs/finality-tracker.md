@@ -31,11 +31,29 @@ tracker.add_block(Block("a1", "genesis", 1))
 
 assessment = tracker.assess("a1", required_confirmations=6)
 print(assessment.confirmations_remaining)  # 5
+
+# Persist and later restore the exact fork-choice state.
+snapshot = tracker.snapshot_json()
+restored = FinalityTracker.from_snapshot_json(snapshot)
+assert restored.canonical_tip == tracker.canonical_tip
 ```
+
+## Recovery guarantees
+
+Snapshots use a versioned JSON schema and a SHA-256 integrity checksum. Block
+observations remain in arrival order, which is consensus-relevant when two
+branches have equal cumulative weight. Restoration replays every block through
+the normal validation path, then verifies that the declared canonical tip
+matches the replay result. Reorg history is reconstructed rather than trusted
+as opaque serialized state.
+
+The checksum detects accidental corruption and unexpected modification; it is
+not an authenticity mechanism. Systems that accept snapshots across trust
+boundaries should add a signature or authenticated transport.
 
 ## Limitations and next step
 
-State is currently in-memory and intended for deterministic policy tests or
-stream processors with external checkpointing. The next production increment
-should add a versioned snapshot format plus replay tests so a consumer can
-recover without silently changing canonical-chain decisions.
+Snapshot persistence is caller-managed and the complete observed DAG remains
+in memory. The next production increment should define bounded pruning rules
+that retain enough ancestry to explain and safely reject deep reorganizations.
+

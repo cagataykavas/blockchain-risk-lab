@@ -8,7 +8,11 @@ domain-specific fork-choice score.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 from dataclasses import dataclass
+from typing import Any
 
 
 class ChainValidationError(ValueError):
@@ -17,6 +21,10 @@ class ChainValidationError(ValueError):
 
 class BlockNotCanonicalError(LookupError):
     """Raised when confirmations are requested for a non-canonical block."""
+
+
+class SnapshotValidationError(ValueError):
+    """Raised when persisted tracker state is malformed or corrupted."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +78,8 @@ class FinalityTracker:
     competing tip only matches its score. This avoids artificial reorgs caused
     solely by block arrival order. A strictly heavier branch is required.
     """
+
+    SNAPSHOT_VERSION = 1
 
     def __init__(self) -> None:
         self._blocks: dict[str, Block] = {}
@@ -138,6 +148,97 @@ class FinalityTracker:
             return ()
         return tuple(reversed(self._path_to_root(self._tip)))
 
+    def snapshot_json(self) -> str:
+        """Return a versioned, checksummed JSON snapshot of observed blocks.
+
+        Blocks retain insertion order because equal-weight fork choice keeps the
+        existing canonical tip. Restoring by replay therefore reproduces both
+        the selected tip and the reorganization audit trail.
+        """
+
+        payload: dict[str, Any] = {
+            "schema_version": self.SNAPSHOT_VERSION,
+            "canonical_tip": self._tip,
+            "blocks": [
+                {
+                    "block_hash": block.block_hash,
+                    "parent_hash": block.parent_hash,
+                    "height": block.height,
+                    "weight": block.weight,
+                }
+                for block in self._blocks.values()
+            ],
+        }
+        checksum = hashlib.sha256(self._canonical_json(payload).encode()).hexdigest()
+        return self._canonical_json({**payload, "checksum": f"sha256:{checksum}"})
+
+    @classmethod
+    def from_snapshot_json(cls, snapshot: str) -> FinalityTracker:
+        """Restore state by validating and replaying a snapshot.
+
+        Replaying through :meth:`add_block` reuses all structural invariants;
+        snapshots never bypass normal block validation.
+        """
+
+        try:
+            document = json.loads(snapshot)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise SnapshotValidationError("snapshot must be valid JSON text") from exc
+        if not isinstance(document, dict):
+            raise SnapshotValidationError("snapshot root must be an object")
+
+        required_keys = {"schema_version", "canonical_tip", "blocks", "checksum"}
+        if set(document) != required_keys:
+            raise SnapshotValidationError("snapshot fields do not match schema")
+        if document["schema_version"] != cls.SNAPSHOT_VERSION:
+            raise SnapshotValidationError(
+                f"unsupported snapshot schema version: {document['schema_version']!r}"
+            )
+        blocks = document["blocks"]
+        if not isinstance(blocks, list):
+            raise SnapshotValidationError("snapshot blocks must be a list")
+        canonical_tip = document["canonical_tip"]
+        if canonical_tip is not None and not isinstance(canonical_tip, str):
+            raise SnapshotValidationError("canonical_tip must be a string or null")
+
+        supplied_checksum = document["checksum"]
+        if not isinstance(supplied_checksum, str):
+            raise SnapshotValidationError("snapshot checksum must be a string")
+        payload = {key: value for key, value in document.items() if key != "checksum"}
+        expected_digest = hashlib.sha256(cls._canonical_json(payload).encode()).hexdigest()
+        if not hmac.compare_digest(supplied_checksum, f"sha256:{expected_digest}"):
+            raise SnapshotValidationError("snapshot checksum mismatch")
+
+        tracker = cls()
+        block_keys = {"block_hash", "parent_hash", "height", "weight"}
+        try:
+            for raw_block in blocks:
+                if not isinstance(raw_block, dict) or set(raw_block) != block_keys:
+                    raise SnapshotValidationError("snapshot block fields do not match schema")
+                block_hash = raw_block["block_hash"]
+                parent_hash = raw_block["parent_hash"]
+                height = raw_block["height"]
+                weight = raw_block["weight"]
+                if not isinstance(block_hash, str):
+                    raise SnapshotValidationError("block_hash must be a string")
+                if parent_hash is not None and not isinstance(parent_hash, str):
+                    raise SnapshotValidationError("parent_hash must be a string or null")
+                if isinstance(height, bool) or not isinstance(height, int):
+                    raise SnapshotValidationError("height must be an integer")
+                if isinstance(weight, bool) or not isinstance(weight, int):
+                    raise SnapshotValidationError("weight must be an integer")
+                tracker.add_block(Block(block_hash, parent_hash, height, weight))
+        except ChainValidationError as exc:
+            raise SnapshotValidationError(f"invalid block replay: {exc}") from exc
+
+        if tracker.canonical_tip != canonical_tip:
+            raise SnapshotValidationError("canonical_tip does not match replayed blocks")
+        return tracker
+
+    @staticmethod
+    def _canonical_json(value: object) -> str:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
     def _validate(self, block: Block) -> None:
         if not block.block_hash:
             raise ChainValidationError("block_hash must not be empty")
@@ -192,3 +293,4 @@ class FinalityTracker:
             removed_blocks=tuple(old_path[:old_cut]),
             added_blocks=tuple(reversed(new_path[:new_cut])),
         )
+
