@@ -9,6 +9,9 @@ description = "Deterministic blockchain finality and reorganization risk primiti
 requires-python = ">=3.11"
 license = { text = "MIT" }
 
+[project.optional-dependencies]
+dev = ["ruff==0.14.1"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
@@ -21,3 +24,4 @@ select = ["E", "F", "I", "B", "UP"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
