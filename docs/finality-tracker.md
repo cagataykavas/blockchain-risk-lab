@@ -36,6 +36,15 @@ print(assessment.confirmations_remaining)  # 5
 snapshot = tracker.snapshot_json()
 restored = FinalityTracker.from_snapshot_json(snapshot)
 assert restored.canonical_tip == tracker.canonical_tip
+
+# Authenticate snapshots that cross a trust boundary. Keep the key in a secret
+# manager; only the rotation-friendly key identifier is serialized.
+auth_key = b"replace-with-32-or-more-secret-bytes"
+envelope = tracker.authenticated_snapshot_json(auth_key, key_id="snapshot-2026-10")
+restored = FinalityTracker.from_authenticated_snapshot_json(
+    envelope,
+    {"snapshot-2026-10": auth_key},
+)
 ```
 
 ## Recovery guarantees
@@ -48,8 +57,18 @@ matches the replay result. Reorg history is reconstructed rather than trusted
 as opaque serialized state.
 
 The checksum detects accidental corruption and unexpected modification; it is
-not an authenticity mechanism. Systems that accept snapshots across trust
-boundaries should add a signature or authenticated transport.
+not an authenticity mechanism. For trust-boundary recovery, the authenticated
+snapshot API wraps the complete snapshot in HMAC-SHA256, verifies it with
+constant-time comparison before replay, and records a constrained key ID so
+operators can retain retired verification keys during rotation. Authentication
+keys must be at least 32 bytes and are never serialized.
+
+HMAC establishes authenticity only among systems that share the secret. It
+does not provide public verification, signer identity separation, compromise
+recovery for already exposed keys, or a trusted creation time. Production
+deployments should source keys from a secret manager, restrict verification-key
+access, rotate keys, and use an authenticated transport. A public audit trail
+would require an asymmetric signature and externally anchored timestamp.
 
 ## Limitations and next step
 

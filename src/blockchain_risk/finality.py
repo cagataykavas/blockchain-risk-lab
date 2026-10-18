@@ -11,6 +11,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -80,6 +82,9 @@ class FinalityTracker:
     """
 
     SNAPSHOT_VERSION = 1
+    AUTH_ENVELOPE_VERSION = 1
+    MIN_AUTH_KEY_BYTES = 32
+    _KEY_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
     def __init__(self) -> None:
         self._blocks: dict[str, Block] = {}
@@ -172,6 +177,81 @@ class FinalityTracker:
         checksum = hashlib.sha256(self._canonical_json(payload).encode()).hexdigest()
         return self._canonical_json({**payload, "checksum": f"sha256:{checksum}"})
 
+    def authenticated_snapshot_json(self, auth_key: bytes, key_id: str) -> str:
+        """Return a snapshot wrapped in a key-rotatable HMAC envelope.
+
+        The authentication key is caller-managed and is never serialized. The
+        key identifier lets a restore path select the right key after rotation.
+        """
+
+        self._validate_auth_key(auth_key)
+        self._validate_key_id(key_id)
+        payload: dict[str, Any] = {
+            "envelope_version": self.AUTH_ENVELOPE_VERSION,
+            "key_id": key_id,
+            "snapshot": json.loads(self.snapshot_json()),
+        }
+        digest = hmac.new(
+            auth_key,
+            self._canonical_json(payload).encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        return self._canonical_json({**payload, "mac": f"hmac-sha256:{digest}"})
+
+    @classmethod
+    def from_authenticated_snapshot_json(
+        cls,
+        envelope: str,
+        verification_keys: Mapping[str, bytes],
+    ) -> FinalityTracker:
+        """Verify an authenticated envelope before replaying its snapshot.
+
+        ``verification_keys`` may contain active and retired keys, allowing
+        persisted snapshots to survive key rotation without embedding secrets.
+        Unknown key identifiers and MAC failures are rejected before block
+        replay so unauthenticated state never reaches chain validation.
+        """
+
+        try:
+            document = json.loads(envelope)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise SnapshotValidationError("authenticated snapshot must be valid JSON") from exc
+        if not isinstance(document, dict):
+            raise SnapshotValidationError("authenticated snapshot root must be an object")
+
+        required_keys = {"envelope_version", "key_id", "snapshot", "mac"}
+        if set(document) != required_keys:
+            raise SnapshotValidationError("authenticated snapshot fields do not match schema")
+        if document["envelope_version"] != cls.AUTH_ENVELOPE_VERSION:
+            raise SnapshotValidationError(
+                f"unsupported authentication envelope version: {document['envelope_version']!r}"
+            )
+
+        key_id = document["key_id"]
+        if not isinstance(key_id, str) or cls._KEY_ID_PATTERN.fullmatch(key_id) is None:
+            raise SnapshotValidationError("authenticated snapshot key_id is invalid")
+        if key_id not in verification_keys:
+            raise SnapshotValidationError("unknown snapshot authentication key")
+        auth_key = verification_keys[key_id]
+        cls._validate_auth_key(auth_key)
+
+        snapshot = document["snapshot"]
+        if not isinstance(snapshot, dict):
+            raise SnapshotValidationError("authenticated snapshot payload must be an object")
+        supplied_mac = document["mac"]
+        if not isinstance(supplied_mac, str):
+            raise SnapshotValidationError("authenticated snapshot MAC must be a string")
+        payload = {key: value for key, value in document.items() if key != "mac"}
+        expected_digest = hmac.new(
+            auth_key,
+            cls._canonical_json(payload).encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(supplied_mac, f"hmac-sha256:{expected_digest}"):
+            raise SnapshotValidationError("authenticated snapshot MAC mismatch")
+
+        return cls.from_snapshot_json(cls._canonical_json(snapshot))
+
     @classmethod
     def from_snapshot_json(cls, snapshot: str) -> FinalityTracker:
         """Restore state by validating and replaying a snapshot.
@@ -239,6 +319,24 @@ class FinalityTracker:
     def _canonical_json(value: object) -> str:
         return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
+    @classmethod
+    def _validate_auth_key(cls, auth_key: bytes) -> None:
+        if not isinstance(auth_key, bytes):
+            raise TypeError("snapshot authentication key must be bytes")
+        if len(auth_key) < cls.MIN_AUTH_KEY_BYTES:
+            raise ValueError(
+                f"snapshot authentication key must contain at least {cls.MIN_AUTH_KEY_BYTES} bytes"
+            )
+
+    @classmethod
+    def _validate_key_id(cls, key_id: str) -> None:
+        if not isinstance(key_id, str):
+            raise TypeError("snapshot key_id must be a string")
+        if cls._KEY_ID_PATTERN.fullmatch(key_id) is None:
+            raise ValueError(
+                "snapshot key_id must be 1-128 ASCII letters, digits, dots, underscores, or hyphens"
+            )
+
     def _validate(self, block: Block) -> None:
         if not block.block_hash:
             raise ChainValidationError("block_hash must not be empty")
@@ -293,4 +391,3 @@ class FinalityTracker:
             removed_blocks=tuple(old_path[:old_cut]),
             added_blocks=tuple(reversed(new_path[:new_cut])),
         )
-
