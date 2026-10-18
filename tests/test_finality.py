@@ -12,6 +12,8 @@ from blockchain_risk import (
 
 
 class FinalityTrackerTests(unittest.TestCase):
+    AUTH_KEY = b"a" * 32
+
     def setUp(self) -> None:
         self.tracker = FinalityTracker()
         self.tracker.add_block(Block("g", None, 0))
@@ -115,7 +117,62 @@ class FinalityTrackerTests(unittest.TestCase):
         with self.assertRaisesRegex(SnapshotValidationError, "unsupported snapshot"):
             FinalityTracker.from_snapshot_json(json.dumps(document))
 
+    def test_authenticated_snapshot_round_trip_supports_key_rotation(self) -> None:
+        self.tracker.add_block(Block("b1", "g", 1, weight=3))
+        envelope = self.tracker.authenticated_snapshot_json(
+            self.AUTH_KEY,
+            key_id="snapshot-key-2026-10",
+        )
+
+        restored = FinalityTracker.from_authenticated_snapshot_json(
+            envelope,
+            {
+                "snapshot-key-2026-09": b"retired-key" * 3,
+                "snapshot-key-2026-10": self.AUTH_KEY,
+            },
+        )
+
+        self.assertEqual(restored.canonical_chain(), self.tracker.canonical_chain())
+        self.assertEqual(restored.reorg_history, self.tracker.reorg_history)
+
+    def test_authenticated_snapshot_rejects_tampering_before_replay(self) -> None:
+        document = json.loads(
+            self.tracker.authenticated_snapshot_json(self.AUTH_KEY, key_id="active-key")
+        )
+        document["snapshot"]["blocks"][1]["parent_hash"] = "missing"
+
+        with self.assertRaisesRegex(SnapshotValidationError, "MAC mismatch"):
+            FinalityTracker.from_authenticated_snapshot_json(
+                json.dumps(document),
+                {"active-key": self.AUTH_KEY},
+            )
+
+    def test_authenticated_snapshot_rejects_wrong_or_unknown_key(self) -> None:
+        envelope = self.tracker.authenticated_snapshot_json(self.AUTH_KEY, key_id="active-key")
+
+        with self.assertRaisesRegex(SnapshotValidationError, "unknown snapshot"):
+            FinalityTracker.from_authenticated_snapshot_json(
+                envelope,
+                {"retired-key": self.AUTH_KEY},
+            )
+        with self.assertRaisesRegex(SnapshotValidationError, "MAC mismatch"):
+            FinalityTracker.from_authenticated_snapshot_json(
+                envelope,
+                {"active-key": b"b" * 32},
+            )
+
+    def test_authenticated_snapshot_rejects_weak_keys_and_invalid_key_ids(self) -> None:
+        with self.assertRaisesRegex(ValueError, "at least 32 bytes"):
+            self.tracker.authenticated_snapshot_json(b"too-short", key_id="active-key")
+        with self.assertRaisesRegex(ValueError, "key_id"):
+            self.tracker.authenticated_snapshot_json(self.AUTH_KEY, key_id="contains spaces")
+
+    def test_authenticated_snapshot_is_deterministic(self) -> None:
+        first = self.tracker.authenticated_snapshot_json(self.AUTH_KEY, key_id="active-key")
+        second = self.tracker.authenticated_snapshot_json(self.AUTH_KEY, key_id="active-key")
+
+        self.assertEqual(first, second)
+
 
 if __name__ == "__main__":
     unittest.main()
-
